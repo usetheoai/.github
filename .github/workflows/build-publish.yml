@@ -1,0 +1,362 @@
+# Reusable build-publish — the single hardened image pipeline for the whole org.
+#
+# Shape: (optional Trivy gate) → buildx build+push (GHA cache) → SBOM + SLSA mode=max
+# attestations + keyless cosign sign (release only) → identity-pinned cosign verify.
+# Every action is pinned by commit SHA. Callers stay thin: a per-repo `ci.yml`/gate job
+# runs the language-specific tests, then `publish.yml` calls THIS workflow.
+#
+# Channels (docker/metadata-action): develop → :develop + :develop-<sha>;
+# tag vX.Y.Z → :X.Y.Z + :X.Y + :latest. Signing/SBOM/provenance only when sign=true.
+#
+# Inputs added in the org-standardization pass (2026-06-30):
+#   trivy           — gate the image on CRITICAL/HIGH CVEs (Trivy) before push
+#   verify          — cosign verify the signature with an identity pinned to THIS workflow
+#   dockerhub_image — also publish to docker.io/<this> when the DOCKERHUB_TOKEN secret is set
+name: build-publish
+on:
+  workflow_call:
+    inputs:
+      image:           { required: true,  type: string }
+      dockerfile:      { required: true,  type: string }
+      context:         { required: false, type: string,  default: "." }
+      # Empty by default = derived from the repository owner at runtime (see the
+      # `resolve-registry` step). Fixing the owner in text is the step the migration runbook
+      # lists as the most forgotten: a transfer from an account to an organisation changes
+      # the GHCR namespace, and a fixed value starts giving 403 on push — a late failure, in
+      # another repository's CI.
+      registry:        { required: false, type: string,  default: "" }
+      # Extra build-args, one per line (`NAME=value`). Optional on purpose: this reusable
+      # serves FIVE repositories, and passing an arg the consumer's Dockerfile does not
+      # declare produces an "unused build arg" warning in all of them. Whoever needs one
+      # declares it.
+      #
+      # The case that motivated it: the engine's binary embedded `version=dev` and
+      # `built_at=unknown` because the build never injected ldflags. The endpoint was honest
+      # — it said "unknown" rather than a plausible-but-false sha — but the status dashboard
+      # showed "dev" as the production version, which demonstrates no version at all.
+      build_args:      { required: false, type: string,  default: "" }
+      sign:            { required: false, type: boolean, default: false }   # SBOM+provenance(mode=max)+cosign — release only
+      verify:          { required: false, type: boolean, default: false }   # identity-pinned cosign verify (needs sign=true)
+      trivy:           { required: false, type: boolean, default: false }   # CRITICAL/HIGH Trivy gate before push (uses .trivyignore if present)
+      dockerhub_image: { required: false, type: string,  default: "" }      # e.g. "usetheo/themory" — also push to Docker Hub when DOCKERHUB_TOKEN is set
+      # Default = `ubuntu-latest`, a GitHub-hosted runner (2026-09-16).
+      #
+      # It used to be the `usetheoai` org's Blacksmith fleet (2026-07-30), and the argument
+      # written here against a GitHub-hosted default was that it would "spend the calling
+      # account's minutes, in silence". That held while the repository was private; on a
+      # PUBLIC repo GitHub's runner is free, so the cost the argument protected against
+      # stopped existing — and the old default charged an outside consumer for a fleet they
+      # do not have.
+      #
+      # The input still exists: anyone with a fleet of their own passes the label.
+      runner:          { required: false, type: string,  default: '["ubuntu-latest"]' }
+      # Amazon ECR, the registry production pulls from (theo-infra-live `registry/ecr`).
+      # Empty = no ECR push: the other repositories of the org call this workflow too, and
+      # nothing here may assume an AWS role on their behalf. Both come from the CALLER's
+      # repository variables, so the account id is never fixed in text.
+      ecr_registry:    { required: false, type: string,  default: "" }      # e.g. <account-id>.dkr.ecr.us-east-1.amazonaws.com
+      aws_role_arn:    { required: false, type: string,  default: "" }      # role assumed through GitHub OIDC to push to ECR
+    secrets:
+      # Read-only deploy key for theo-contracts — the PREFERRED route since 2026-07-31. It
+      # reaches exactly one repository, read-only, revocable on its own. The previous PAT died
+      # (`Bad credentials`) and took down 10 builds without naming the cause, because the same
+      # dead credential appeared as `Repository not found` in the image build.
+      GOMOD_SSH_KEY:      { required: false }
+      # Legacy fallback. Kept for consumers of the reusable that still use it — the swap is
+      # additive, not a break of contract.
+      GOMOD_TOKEN:        { required: false }   # cross-repo read for the pinned private theo-contracts module
+      DOCKERHUB_USERNAME: { required: false }
+      DOCKERHUB_TOKEN:    { required: false }
+permissions:
+  contents: read
+  packages: write
+  id-token: write   # consumed only when sign=true (keyless cosign); harmless otherwise
+  attestations: write   # `actions/attest-build-provenance` below; write scope for attestations only
+
+# Grouped by IMAGE and `cancel-in-progress: false`, which is the opposite of the CI default
+# and deliberate: this workflow builds, signs with cosign and pushes to a registry.
+# Cancelling halfway leaves a published tag without a signature, or a signature without the
+# image it covers. The gain from cancelling a superseded build does not pay for that risk.
+#
+# `github.ref` joins the image in the group because the same reusable is called in a matrix:
+# two different images from the same commit should run in parallel, and two publications of
+# the SAME image should not.
+concurrency:
+  group: publish-${{ inputs.image }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-publish:
+    # GitHub's default is 6 HOURS: a hung job burns that in billed minutes and holds a
+    # concurrency slot the whole time.
+    timeout-minutes: 30
+    runs-on: ${{ fromJSON(inputs.runner) }}   # default = ubuntu-latest; see the `runner` input
+    env:
+      # `secrets` is NOT allowed in step `if:` — lift the token to a job-level env so the
+      # Docker Hub guards below can use `env.*` (valid in if/with). Stays masked in logs.
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      # Exposed in the job environment because `secret-envs:` references the NAME of a
+      # variable, not a value — which is what lets the multi-line private key load intact.
+      # Actions masks the value in logs as usual.
+      GOMOD_SSH_KEY: ${{ secrets.GOMOD_SSH_KEY }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      # Derives the GHCR namespace from the repository owner when the caller does not pass
+      # one. It replaces a default fixed in text (`ghcr.io/usetheodev`), which the migration
+      # runbook lists among the forgotten points: transferring the repo to an organisation
+      # changes the namespace, and the fixed value starts producing 403 on push — a late
+      # failure, and in another repository's CI.
+      #
+      # Lowercased because GitHub repository names preserve case and OCI references do not
+      # accept it.
+      #
+      # `[:upper:]`/`[:lower:]` rather than `A-Z`/`a-z` (SC2018/SC2019): the literal ranges
+      # depend on the locale — in a non-C locale the collation order may not be ASCII, and
+      # the translation comes out wrong for characters outside the expected set. The POSIX
+      # classes carry no such dependency.
+      - name: Resolve registry namespace
+        id: resolve-registry
+        env:
+          EXPLICIT: ${{ inputs.registry }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          if [ -n "$EXPLICIT" ]; then
+            echo "registry=$EXPLICIT" >> "$GITHUB_OUTPUT"
+          else
+            echo "registry=ghcr.io/$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute tags (community-standard channels)
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          # Docker Hub image is added ONLY when both the input and the token are present,
+          # so a missing secret never produces an un-pushable docker.io tag.
+          images: |
+            ${{ steps.resolve-registry.outputs.registry }}/${{ inputs.image }}
+            ${{ (inputs.dockerhub_image != '' && env.DOCKERHUB_TOKEN != '') && format('docker.io/{0}', inputs.dockerhub_image) || '' }}
+          # The last two rules cover the MANUAL trigger, and they exist because their absence
+          # made that path impossible.
+          #
+          # `release-artifacts.yml` advertises `workflow_dispatch` and the `plan` job handles
+          # `IS_DISPATCH` explicitly by building EVERY image. But no tag rule fired outside
+          # `develop` and `v*` tags, so a dispatch from any other branch produced ZERO tags
+          # and buildx died with `tag is needed when pushing to registry` — measured in run
+          # 30583134483, five images at once.
+          #
+          # An advertised trigger that can never work is worse than an absent one: whoever
+          # uses it concludes the image is broken, not the workflow.
+          #
+          # Branch plus short sha (and not some `latest`): a dispatch's artifact has to be
+          # traceable to the exact commit, and must not collide with the `develop` channel CI
+          # publishes.
+          tags: |
+            type=raw,value=develop,enable=${{ github.ref == 'refs/heads/develop' }}
+            type=sha,prefix=develop-,format=short,enable=${{ github.ref == 'refs/heads/develop' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=ref,event=branch,enable=${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}
+            type=sha,format=short,enable=${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/develop' }}
+
+      # ECR tags are a SEPARATE set, because the repositories are IMMUTABLE: a push that
+      # reuses a tag is refused. `:develop`, `:latest` and `X.Y` move by design, so they would
+      # fail on the second push of the day. What remains names exactly one build — the full
+      # commit SHA on every event, and the release version on a tag — which is also what an
+      # environment pins to know which commit it runs.
+      - name: Compute ECR tags (immutable only)
+        id: meta-ecr
+        if: ${{ inputs.ecr_registry != '' }}
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          images: ${{ inputs.ecr_registry }}/${{ inputs.image }}
+          tags: |
+            type=sha,format=long,prefix=
+            type=semver,pattern={{version}}
+
+      # --- Optional Trivy gate (build locally, scan, THEN push the cache-identical image) ---
+      - name: Build for scan (Trivy gate)
+        if: ${{ inputs.trivy }}
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          load: true
+          tags: ${{ inputs.image }}:scan-target
+          # The SAME build-args as the push below. Diverging here would make Trivy scan a
+          # different image from the published one — the gate would pass over an artifact
+          # that is not what goes to the registry.
+          build-args: ${{ inputs.build_args }}
+          cache-from: type=gha,scope=${{ inputs.image }}
+          # ignore-error: the GitHub Actions cache service (type=gha) intermittently 500s /
+          # returns BlobNotFound on export (esp. large mode=max exports on self-hosted
+          # runners). Cache is a build-time optimization, not a correctness input — a cache
+          # miss/failure must never fail the build. Warns and continues instead.
+          cache-to: type=gha,mode=max,ignore-error=true,scope=${{ inputs.image }}
+          secrets: |
+            gomod_token=${{ secrets.GOMOD_TOKEN }}
+          # The SSH key travels via `secret-envs`, NOT via `secrets`.
+          #
+          # The `key=value` form of `secrets:` is ONE LINE. A private key has several, and
+          # buildx rejects it with `*** is not a valid secret` — measured in run
+          # 30626856096. `secret-envs` references an environment variable and therefore
+          # carries multi-line content intact.
+          #
+          # The local build passed with `--secret id=...,src=file`, which also accepts
+          # multi-line. It was that difference of FORM — not of content — that made the
+          # local test approve what CI refused.
+          secret-envs: |
+            gomod_ssh_key=GOMOD_SSH_KEY
+
+      - name: Trivy vulnerability scan (CRITICAL + HIGH gate)
+        if: ${{ inputs.trivy }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ inputs.image }}:scan-target
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+
+      # Registry login happens HERE — AFTER the (slow, cold-cache) Trivy build-for-scan — so the
+      # GHCR token is FRESH at push time. A long build (e.g. a native-compile image via the Trivy
+      # double-build, ~14 min cold) would otherwise outlive a token fetched at job start → buildkit
+      # re-auths anonymously → 403 on the attestation push. The build-for-scan above needs no
+      # registry login (it loads locally + uses the GHA cache + a public base image).
+      - name: Login to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same placement as the GHCR login, for the same reason: the ECR token is fetched after
+      # the slow build-for-scan so it is fresh at push time. The role is assumed through
+      # GitHub OIDC; no AWS key exists anywhere in GitHub.
+      - name: Assume the ECR publish role
+        id: aws-credentials
+        if: ${{ inputs.ecr_registry != '' }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: us-east-1
+
+      - name: Login to ECR
+        id: ecr-login
+        if: ${{ inputs.ecr_registry != '' }}
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Login to Docker Hub (optional)
+        if: ${{ inputs.dockerhub_image != '' && env.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # --- Build + push (cache-identical to the scanned image when trivy=true) ---
+      - name: Build + push (SBOM + SLSA mode=max on release)
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          build-args: ${{ inputs.build_args }}
+          # One build, both registries: the ECR tags join the same push, so GHCR and ECR hold
+          # the same digest. A skipped meta-ecr leaves an empty line, which the action drops.
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ steps.meta-ecr.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: ${{ inputs.sign }}
+          provenance: ${{ inputs.sign && 'mode=max' || 'false' }}
+          cache-from: type=gha,scope=${{ inputs.image }}
+          # ignore-error: the GitHub Actions cache service (type=gha) intermittently 500s /
+          # returns BlobNotFound on export (esp. large mode=max exports on self-hosted
+          # runners). Cache is a build-time optimization, not a correctness input — a cache
+          # miss/failure must never fail the build. Warns and continues instead.
+          cache-to: type=gha,mode=max,ignore-error=true,scope=${{ inputs.image }}
+          secrets: |
+            gomod_token=${{ secrets.GOMOD_TOKEN }}
+          # The SSH key travels via `secret-envs`, NOT via `secrets`.
+          #
+          # The `key=value` form of `secrets:` is ONE LINE. A private key has several, and
+          # buildx rejects it with `*** is not a valid secret` — measured in run
+          # 30626856096. `secret-envs` references an environment variable and therefore
+          # carries multi-line content intact.
+          #
+          # The local build passed with `--secret id=...,src=file`, which also accepts
+          # multi-line. It was that difference of FORM — not of content — that made the
+          # local test approve what CI refused.
+          secret-envs: |
+            gomod_ssh_key=GOMOD_SSH_KEY
+
+      # GITHUB-NATIVE ATTESTATION, on top of the provenance buildx already embeds.
+      #
+      # They are different things and both are worth having. `provenance: mode=max` in the
+      # step above writes the provenance INSIDE the OCI manifest, where whoever pulls the
+      # image needs a tool to read it. This publishes the same statement to GitHub's
+      # attestation store, where `gh attestation verify` reads it with nothing installed —
+      # which is what makes the chain verifiable by whoever CONSUMES the repository, not only
+      # by whoever builds it.
+      #
+      # Measured in the field (501 workflows, 18 large projects): 3 of 18 attest provenance.
+      # It is LEADING practice, not a floor — it goes in because it is free on a public
+      # repository, and because this workflow already signs with cosign, so the alternative
+      # would be signing without leaving the statement where a consumer finds it.
+      #
+      # PUBLIC repositories only. On a private repository the organisation's plan refuses it
+      # ("Feature not available for the usetheoai organization"), and every caller today is
+      # private: unconditional, this step failed the whole publish after the push and before
+      # the cosign signature below could run (theo-cloud run 36512769358). The cosign keyless
+      # signature is the guarantee either way.
+      - name: Attest build provenance (GitHub-native)
+        if: ${{ inputs.sign && !github.event.repository.private }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.resolve-registry.outputs.registry }}/${{ inputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Install cosign
+        if: ${{ inputs.sign }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # `${{ }}` inside `run:` is substituted INTO THE TEXT of the script before a shell
+      # exists: a value carrying quotes, `;` or `$(...)` stops being an argument and becomes a
+      # command, with access to the job's secrets (#250). Going through the step's `env:` has
+      # no such property — the value arrives as an environment variable, and `"${VAR}"` is one
+      # argument whatever is inside it.
+      #
+      # This is NOT theatre for semgrep: a `workflow_call` input is by definition controlled
+      # by the CALLER, and the set of callers changes without this file changing. Today the
+      # values come from a versioned `publish.yml`; the guarantee used to rest on the
+      # discipline of whoever calls, and now rests on the structure of the workflow.
+      - name: Keyless sign by digest (release only)
+        if: ${{ inputs.sign }}
+        env:
+          IMAGE_REF: ${{ steps.resolve-registry.outputs.registry }}/${{ inputs.image }}@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE_REF}"
+
+      # Confused-deputy guard (EC-2): accept ONLY signatures produced by THIS reusable
+      # workflow (path-pinned) via the GitHub OIDC issuer. One signing identity for every
+      # org image — pinned in one place.
+      - name: Verify the signature (identity-pinned)
+        if: ${{ inputs.sign && inputs.verify }}
+        env:
+          IMAGE_REF: ${{ steps.resolve-registry.outputs.registry }}/${{ inputs.image }}@${{ steps.build.outputs.digest }}
+          # The keyless identity derives from repo plus workflow path. Fixing the owner in
+          # text breaks verification on a transfer — and, worse, a WRONG owner here would
+          # accept a signature produced by ANOTHER workflow. This is the confused-deputy
+          # guard, so it follows the repo that actually runs.
+          IDENTITY_REPO: ${{ github.repository }}
+        run: |
+          cosign verify "${IMAGE_REF}" \
+            --certificate-identity-regexp "^https://github\.com/${IDENTITY_REPO}/\.github/workflows/build-publish\.yml@" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
